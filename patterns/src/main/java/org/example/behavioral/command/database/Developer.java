@@ -1,4 +1,4 @@
-package org.example.behavioral.command;
+package org.example.behavioral.command.database;
 
 public class Developer {
     private final Command insert;
