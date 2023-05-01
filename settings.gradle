@@ -4,4 +4,5 @@ include 'messageBrokers:kafka'
 include 'springSecurityDemo'
 include 'patterns'
 include 'collections'
+include 'webclient'
 
