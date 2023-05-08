@@ -1,8 +1,5 @@
 package org.example.behavioral.iterator;
 
-import java.util.ArrayList;
-import java.util.Collection;
-
 public class JavaDeveloperRunner {
     public static void main(String[] args) {
         String[] skills = {"Java", "Spring", "Hibernate", "Maven", "PostgreSQL"};

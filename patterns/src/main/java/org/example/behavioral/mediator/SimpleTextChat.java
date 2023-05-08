@@ -1,4 +1,4 @@
-package org.example.behavioral.mediator.textchat;
+package org.example.behavioral.mediator;
 
 import java.util.ArrayList;
 import java.util.List;

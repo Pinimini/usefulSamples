@@ -1,4 +1,4 @@
-package org.example.behavioral.mediator.textchat;
+package org.example.behavioral.mediator;
 
 public class SimpleUser implements User {
     Chat chat;

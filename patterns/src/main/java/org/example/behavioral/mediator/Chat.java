@@ -1,4 +1,4 @@
-package org.example.behavioral.mediator.textchat;
+package org.example.behavioral.mediator;
 
 public interface Chat {
     void sendMessage(String message, User user);
