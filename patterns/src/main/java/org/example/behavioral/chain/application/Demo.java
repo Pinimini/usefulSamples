@@ -5,5 +5,15 @@ public class Demo {
         Application app = new Application();
 
 
+        ApplicationProcessor input = new ApplicationInput();
+        ApplicationProcessor reader = new ApplicationReader();
+        ApplicationProcessor result = new ApplicationResult();
+
+        input.setNext(reader);
+        reader.setNext(result);
+
+        input.process(app);
+        app.printHistory();
+
     }
 }
