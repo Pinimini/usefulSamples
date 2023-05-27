@@ -12,6 +12,6 @@ public class Project {
         team.addDeveloper(secondJavaDeveloper);
         team.addDeveloper(cppDeveloper);
 
-        team.createProject();
+        team.writeCode();
     }
 }
