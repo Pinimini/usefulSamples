@@ -5,4 +5,8 @@ include 'springSecurityDemo'
 include 'patterns'
 include 'collections'
 include 'webclient'
+include 'io'
+include 'nio'
+include 'db'
+include 'mapstruct'
 
