@@ -83,7 +83,7 @@ public class JpqlTest {
             var newName = firstStudent.getName() + firstStudent.getName();
             session.detach(firstStudent);
 
-            var query = session.createMutationQuery("update OtusStudent s " +
+            var query = session.createMutationQuery("update Student s " +
                     "set s.name = :name " +
                     "where s.id = :id");
             query.setParameter("id", FIRST_STUDENT_ID);

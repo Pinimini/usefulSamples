@@ -1,9 +1,12 @@
 package org.example;
 
+import lombok.extern.slf4j.Slf4j;
+
 import java.io.Serializable;
 
 
 //implements Serializable - обязательное условие для сериализации
+@Slf4j
 public class Person implements Serializable {
     private static final long serialVersionUID = 1L; // не забывайте про serialVersionUID
     private final int age;
