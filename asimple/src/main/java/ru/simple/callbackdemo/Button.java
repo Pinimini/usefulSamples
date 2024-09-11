@@ -1,5 +1,8 @@
 package ru.simple.callbackdemo;
 
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
 public class Button {
     private final Handler handler;
 
@@ -8,7 +11,13 @@ public class Button {
     }
 
     void click() {
-        handler.handle();
+        Thread thread = new Thread(() -> {
+            handler.handle();
+            log.info("threadNameByButton {}", Thread.currentThread().getName());
+        });
+        thread.start();
     }
+
+
 
 }
