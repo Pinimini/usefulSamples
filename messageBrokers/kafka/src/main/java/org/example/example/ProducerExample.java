@@ -1,5 +1,6 @@
 package org.example.example;
 
+import org.apache.kafka.clients.producer.KafkaProducer;
 import org.example.demo.Producer;
 
 public class ProducerExample {
@@ -7,5 +8,6 @@ public class ProducerExample {
         Producer producer = new Producer();
         producer.outputToInfo();
         producer.outputToDebug();
+        KafkaProducer<String, String> kafkaProducer;
     }
 }

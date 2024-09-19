@@ -1,15 +1,23 @@
 package com.example.springsecuritydemo.rest;
 
 import com.example.springsecuritydemo.model.Developer;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.AsyncResult;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 @RestController
 @RequestMapping("/api/v1/developers")
+@Slf4j
 public class DeveloperRestController {
 
     private List<Developer> DEVELOPERS = Stream.of(
@@ -19,8 +27,20 @@ public class DeveloperRestController {
     ).collect(Collectors.toList());
 
     @GetMapping
-    public List<Developer> getAll() {
-        return DEVELOPERS;
+    @Async
+    public CompletableFuture<Developer> getAll() throws ExecutionException, InterruptedException, TimeoutException {
+
+        log.info("Запрос всех работников внутри Async 1");
+        Developer developer;
+        try {
+            TimeUnit.SECONDS.sleep(30);
+            developer = new Developer(1L, "Ivan", "Ivanov");
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        log.info("Thread внутри Async 2");
+
+        return new AsyncResult<Developer>(developer).completable();
     }
 
     @GetMapping("/{id}")

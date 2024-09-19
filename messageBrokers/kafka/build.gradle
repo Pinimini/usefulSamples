@@ -2,5 +2,4 @@
 
 dependencies {
     implementation 'org.apache.kafka:kafka-clients:3.3.2'
-
 }

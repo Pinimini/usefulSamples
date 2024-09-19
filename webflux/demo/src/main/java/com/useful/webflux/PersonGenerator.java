@@ -21,6 +21,6 @@ public class PersonGenerator {
                                     return state + 1;
                                 })
                 .take(6)
-                .delayElements(Duration.ofSeconds(1));
+                .delayElements(Duration.ofSeconds(1), timer);
     }
 }

@@ -6,15 +6,11 @@ import com.useful.webflux.producer.IntegerGeneratorReactorFlux;
 import com.useful.webflux.producer.StringValue;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -46,12 +42,15 @@ public class SourceDataController {
     }
 
     @GetMapping(value = "/data-mono/{seed}", produces = "application/json")
-    public Mono<StringValue> dataMono(@PathVariable("seed") long seed) {
+    public StringValue dataMono(@PathVariable("seed") long seed) {
         log.info("request for string data-mono, seed:{}", seed);
         log.info("Method request for string data done");
 
+/*        var future = CompletableFuture
+                .supplyAsync(() -> dataProducerStringBlocked.produce(seed), executor); */
         var future = CompletableFuture
                 .supplyAsync(() -> dataProducerStringBlocked.produce(seed), executor);
-        return Mono.fromFuture(future);
+        //return Mono.fromFuture(future);
+        return dataProducerStringBlocked.produce(seed);
     }
 }
