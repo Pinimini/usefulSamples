@@ -1,4 +1,4 @@
-package org.example.behavioral.command;
+package org.example.behavioral.command.some;
 
 import java.util.ArrayDeque;
 import java.util.Queue;

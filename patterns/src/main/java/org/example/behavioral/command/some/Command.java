@@ -1,4 +1,4 @@
-package org.example.behavioral.command;
+package org.example.behavioral.command.some;
 
 @FunctionalInterface
 public interface Command {
