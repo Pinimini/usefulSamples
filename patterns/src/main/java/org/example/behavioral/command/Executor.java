@@ -1,7 +1,6 @@
-package org.example.behavioral.command.some;
+package org.example.behavioral.command;
 
 import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.Queue;
 
 public class Executor {

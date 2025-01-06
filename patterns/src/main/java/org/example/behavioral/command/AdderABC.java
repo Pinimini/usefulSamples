@@ -1,4 +1,4 @@
-package org.example.behavioral.command.some;
+package org.example.behavioral.command;
 
 public class AdderABC implements Command {
 
