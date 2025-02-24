@@ -1,11 +1,11 @@
 package org.example.behavioral.memento.demo;
 
-import java.time.LocalDateTime;
 import java.util.ArrayDeque;
 import java.util.Deque;
 
 public class Originator {
 
+    //Это Originator + Caretaker
     private final Deque<Memento> stack = new ArrayDeque<>();
 
     private final DateTimeProvider dateTimeProvider;
