@@ -18,4 +18,7 @@ public class Client {
     @EqualsAndHashCode.Exclude
     @ToString.Exclude
     private Avatar avatars;
+
+    @Version
+    private int name;
 }

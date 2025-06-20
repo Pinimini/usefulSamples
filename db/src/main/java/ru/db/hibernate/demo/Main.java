@@ -8,12 +8,12 @@ import liquibase.database.DatabaseFactory;
 import liquibase.database.jvm.JdbcConnection;
 import liquibase.exception.LiquibaseException;
 import lombok.extern.slf4j.Slf4j;
+import org.hibernate.Session;
+import org.hibernate.SessionFactory;
 import ru.db.hibernate.core.HibernateUtils;
 import ru.db.hibernate.demo.model.Avatar;
 import ru.db.hibernate.demo.model.Client;
 import ru.db.hibernate.demo.model.NickName;
-import org.hibernate.Session;
-import org.hibernate.SessionFactory;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -57,6 +57,12 @@ public class Main {
 
             session.getTransaction().begin();
             session.save(client);
+            session.getTransaction().commit();
+
+            session.getTransaction().begin();
+            Avatar avatar2 = new Avatar();
+            client.setAvatars(avatar2);
+            session.merge(client);
             session.getTransaction().commit();
         }
     }

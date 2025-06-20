@@ -5,7 +5,8 @@ create table avatar (
 );
 create table client (
                         id bigserial not null,
-                        primary key (id)
+                        primary key (id),
+                        name int
 );
 create table nickname (
                           avatar_id bigint unique,
