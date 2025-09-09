@@ -22,8 +22,9 @@ import java.sql.SQLException;
 
 @Slf4j
 public class Main {
+    private static NickName nickName;
     public static void main(String[] args) throws LiquibaseException, SQLException {
-
+        nickName.save()
         try (
                 Connection connection = DriverManager.getConnection("jdbc:postgresql://localhost:5432/useful_samples", "admin", "admin");
                 JdbcConnection jdbcConnection = new JdbcConnection(connection);
@@ -43,6 +44,7 @@ public class Main {
 
             log.info("session = {}", session);
             Client client = new Client();
+
 
 
             Avatar avatar = new Avatar();
