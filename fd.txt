@@ -1,0 +1,251 @@
+package ru.vtb.business.regular.kasenc.bankcash.service;
+
+// импорты — как в исходном файле, плюс:
+// import feign.FeignException;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BankCashCheckFraudService {
+
+    private final FRKKTaskService frkkTaskService;
+    private final ApplicationRepository applicationRepository;
+    private final ClientCashExchangeService clientCashExchangeService;
+    private final SpmMapper spmMapper;
+    private final CheckFraudLegalClient checkFraudClient;
+    private final BankCashMonitoring bankCashMonitoring;
+
+    public void checkFraudSpm(Application application) {
+        log.info("Выполняются проверки чекфрод");
+
+        // ИСПРАВЛЕНО: строка аналитики "exceptions / 5xx / 4xx (кроме 400, 404)" -> резолюция по умолчанию.
+        // В аналитике помечено "уточнить, что будет отдавать checks-fraud" — сверить перечень кодов.
+        SpmAnalyzeResponse analyzeResponse;
+        try {
+            analyzeResponse = checkFraudClient.analyze(spmMapper.mapApplicationToSAVOBSKAnalyzeRequest(application),
+                    application.getProductTypeCode().name(), application.getId(), null);
+        } catch (FeignException e) {
+            if (e.status() == 400 || e.status() == 404) {
+                throw e;
+            }
+            log.error("Ошибка вызова check-fraud, применяется резолюция по умолчанию", e);
+            handleTechChallenge(application);
+            return;
+        }
+
+        // ИСПРАВЛЕНО: riskResult / triggeredRule / actionCode могут отсутствовать -> раньше был NPE
+        ActionCode actionCode = null;
+        String actionSubCode = null;
+        if (analyzeResponse != null && analyzeResponse.getRiskResult() != null
+                && analyzeResponse.getRiskResult().getTriggeredRule() != null) {
+            actionCode = analyzeResponse.getRiskResult().getTriggeredRule().getActionCode();
+            actionSubCode = analyzeResponse.getRiskResult().getTriggeredRule().getActionSubCode();
+        }
+        log.info("От check-fraud пришел actionCode: {}", actionCode);
+        log.info("От check-fraud пришел actionSubCode: {}", actionSubCode);
+
+        if (actionCode == null) {
+            log.info("Непредусмотренная резолюция (actionCode отсутствует)");
+            handleUnexpectedResolution(application);
+            return;
+        }
+
+        switch (actionCode) {
+            case ALLOW -> {
+                log.info("Операция разрешена");
+                // ИСПРАВЛЕНО: метрика (подставьте реальный метод BankCashMonitoring)
+                bankCashMonitoring.incrementCounter("cash_bank_cash_analyze_success_allow");
+                application.setSpmActionCode(actionCode);
+                application.setSpmActionTimestamp(OffsetDateTime.now());
+                // ИСПРАВЛЕНО: сохраняем до создания задачи — колбэк перечитывает заявку из БД
+                applicationRepository.saveAndFlush(application);
+                frkkTaskService.sendApplicationProcessingTask(application,
+                        id -> handleDocumentOnSuccess(id),
+                        t -> handleDocumentOnError(t, "Операция отменена"));
+            }
+            case DENY -> {
+                if ("AML".equals(actionSubCode)) {
+                    log.info("Операция запрещена");
+                    bankCashMonitoring.incrementCounter("cash_bank_cash_analyze_success_deny");
+                    application.setSpmActionCode(actionCode);
+                    application.setSpmActionTimestamp(OffsetDateTime.now());
+                    // ИСПРАВЛЕНО: notification_code ставится ДО updateApplicationStatus,
+                    // иначе он не попадает в saveAndFlush внутри updateApplicationStatus
+                    application.setApplicationNotificationCode(ApplicationNotificationCode.DENIED_SPM);
+                    updateApplicationStatus(application, ApplicationBankStatusCode.DECLINED,
+                            ApplicationBankSubstatusCode.DENIED_SPM, "");
+                } else {
+                    log.info("Непредусмотренная резолюция (DENY с подстатусом != AML)");
+                    handleUnexpectedResolution(application);
+                }
+            }
+            case REVIEW -> {
+                if ("AML".equals(actionSubCode)) {
+                    log.info("Требуется дополнительный контроль");
+                    bankCashMonitoring.incrementCounter("cash_bank_cash_analyze_success_review");
+                    application.setSpmActionCode(actionCode);
+                    application.setSpmActionTimestamp(OffsetDateTime.now());
+                    // ИСПРАВЛЕНО: порядок по аналитике — сначала дедлайн и нотификация (п.6),
+                    // потом сохранение и отправка статуса в client-cash (п.7)
+                    calculateSpmDeadline(application, application.getSalePoint().getUtcShift());
+                    updateApplicationStatus(application, ApplicationBankStatusCode.CONTROL_SPM,
+                            null, "");
+                } else {
+                    log.info("Непредусмотренная резолюция (REVIEW с подстатусом != AML)");
+                    handleUnexpectedResolution(application);
+                }
+            }
+            // ИСПРАВЛЕНО: CHALLENGE без подкода — отдельная ветка (недоступность СПМ), раньше уходил в default
+            case CHALLENGE -> {
+                if (actionSubCode == null || actionSubCode.isBlank()) {
+                    log.info("Недоступность СПМ, применяется резолюция по умолчанию");
+                    handleTechChallenge(application);
+                } else {
+                    log.info("Непредусмотренная резолюция (CHALLENGE с подстатусом)");
+                    handleUnexpectedResolution(application);
+                }
+            }
+            default -> {
+                log.info("Непредусмотренная резолюция");
+                handleUnexpectedResolution(application);
+            }
+        }
+    }
+
+    private void handleUnexpectedResolution(Application application) {
+        bankCashMonitoring.incrementCounter("cash_bank_cash_analyze_fail_unexpected");
+        application.setSpmActionCode(ActionCode.AUTO_ALLOW);
+        application.setSpmActionTimestamp(OffsetDateTime.now());
+        applicationRepository.saveAndFlush(application);
+        // ИСПРАВЛЕНО: EXECUTE отправляется только в этой ветке (раньше — для любого успешного создания задачи)
+        frkkTaskService.sendApplicationProcessingTask(application,
+                id -> handleDocumentOnSuccess(id, "Получена непредусмотренная резолюция"),
+                t -> handleDocumentOnError(t, "Получена непредусмотренная резолюция. Операция отменена по техническим причинам"));
+    }
+
+    // ИСПРАВЛЕНО: новая ветка CHALLENGE / тех. ошибка — без POST update/activity
+    private void handleTechChallenge(Application application) {
+        bankCashMonitoring.incrementCounter("cash_bank_cash_analyze_fail_tech_challenge");
+        application.setSpmActionCode(ActionCode.AUTO_ALLOW);
+        application.setSpmActionTimestamp(OffsetDateTime.now());
+        applicationRepository.saveAndFlush(application);
+        frkkTaskService.sendApplicationProcessingTask(application,
+                id -> handleDocumentOnSuccess(id),
+                t -> handleDocumentOnError(t));
+    }
+
+    private void calculateSpmDeadline(Application application, Integer utcShift) {
+
+        OffsetDateTime createdOffsetDateTime = application.getCreatedTimestamp().toInstant()
+                .atZone(ZoneOffset.UTC)
+                .toOffsetDateTime();
+
+        OffsetDateTime localCreatedTime = createdOffsetDateTime.withOffsetSameInstant(
+                ZoneOffset.ofTotalSeconds(utcShift * 3600));
+
+        LocalDate localCreatedDate = localCreatedTime.toLocalDate();
+
+        LocalDate operationDateVal = application.getOperationDate();
+
+        // Вычисляем разницу в днях между началом дня операции и началом дня создания (в локальном времени ТП)
+        long daysDifference = ChronoUnit.DAYS.between(localCreatedDate, operationDateVal);
+
+        if (daysDifference == 0) {
+            application.setSpmDeadline(createdOffsetDateTime.plusHours(2));
+            application.setApplicationNotificationCode(ApplicationNotificationCode.SPM_CHECK_2);
+
+        } else if (daysDifference == 1) {
+            // ИСПРАВЛЕНО (сверить со страницей "Определение дедлайна и нотификации по REVIEW"):
+            // "завтра" = день создания + 1 = operationDate. Было operationDate.plusDays(1) — двойной сдвиг.
+            LocalDateTime tomorrow0800Local = localCreatedDate.plusDays(1).atTime(8, 0, 0);
+
+            ZoneOffset targetOffset = ZoneOffset.ofTotalSeconds(utcShift * 3600);
+            OffsetDateTime tomorrow0800Offset = tomorrow0800Local.atOffset(targetOffset);
+
+            application.setSpmDeadline(tomorrow0800Offset.withOffsetSameInstant(ZoneOffset.UTC));
+            application.setApplicationNotificationCode(ApplicationNotificationCode.SPM_CHECK_48);
+
+        } else if (daysDifference == 2) {
+            // ИСПРАВЛЕНО (сверить со страницей дедлайнов): "послезавтра" = день создания + 2 = operationDate.
+            // Было operationDate.plusDays(2) — дедлайн оказывался через 4 дня после создания,
+            // позже, чем в ветке daysDifference > 2 (+48 часов).
+            LocalDateTime dayAfterTomorrow0000Local = localCreatedDate.plusDays(2).atStartOfDay();
+
+            ZoneOffset targetOffset = ZoneOffset.ofTotalSeconds(utcShift * 3600);
+            OffsetDateTime dayAfterTomorrow0000Offset = dayAfterTomorrow0000Local.atOffset(targetOffset);
+
+            application.setSpmDeadline(dayAfterTomorrow0000Offset.withOffsetSameInstant(ZoneOffset.UTC));
+            application.setApplicationNotificationCode(ApplicationNotificationCode.SPM_CHECK_48);
+
+        } else if (daysDifference > 2) {
+            application.setSpmDeadline(createdOffsetDateTime.plusHours(48));
+            application.setApplicationNotificationCode(ApplicationNotificationCode.SPM_CHECK_48);
+        }
+    }
+
+    /**
+     * Задача в ФРКК создана (ALLOW, CHALLENGE): только субстатус UNPROCESSED_TASK_CREATED.
+     */
+    public void handleDocumentOnSuccess(UUID id) {
+        handleDocumentOnSuccess(id, null);
+    }
+
+    /**
+     * Задача в ФРКК создана. executeDescription != null — дополнительно POST update/activity с EXECUTE
+     * (только для непредусмотренной резолюции).
+     */
+    public void handleDocumentOnSuccess(UUID id, String executeDescription) {
+        Optional<Application> applicationOptional = applicationRepository.findById(id);
+        if (applicationOptional.isPresent()) {
+            Application application = applicationOptional.get();
+            // ИСПРАВЛЕНО: было DECLINED + FRKK_TASK_ERROR — успешная заявка отклонялась.
+            // По аналитике меняется только субстатус.
+            application.setBankSubstatusCode(ApplicationBankSubstatusCode.UNPROCESSED_TASK_CREATED);
+            applicationRepository.saveAndFlush(application);
+            if (executeDescription != null) {
+                checkFraudClient.updateActivity(spmMapper.mapToUpdateActivity(UpdateType.EXECUTE, executeDescription, null),
+                        application.getProductTypeCode().name(), application.getId(), null);
+            }
+        }
+    }
+
+    /**
+     * Задача в ФРКК не создана, без POST update/activity (CHALLENGE / тех. ошибка).
+     */
+    public void handleDocumentOnError(UUID id) {
+        handleDocumentOnError(id, null);
+    }
+
+    /**
+     * Задача в ФРКК не создана. cancelDescription != null — дополнительно POST update/activity с CANCEL.
+     */
+    public void handleDocumentOnError(UUID id, String cancelDescription) {
+        Optional<Application> applicationOptional = applicationRepository.findById(id);
+        if (applicationOptional.isPresent()) {
+            Application application = applicationOptional.get();
+            application.setApplicationNotificationCode(ApplicationNotificationCode.FRKK_TASK_ERROR);
+            updateApplicationStatus(application, ApplicationBankStatusCode.DECLINED,
+                    ApplicationBankSubstatusCode.DECLINED_TASK_ERROR, "");
+            if (cancelDescription != null) {
+                checkFraudClient.updateActivity(spmMapper.mapToUpdateActivity(UpdateType.CANCEL, cancelDescription, null),
+                        application.getProductTypeCode().name(), application.getId(), null);
+            }
+            applicationRepository.save(application);
+        }
+    }
+
+    public void updateApplicationStatus(Application application,
+                                        ApplicationBankStatusCode applicationStatusCode,
+                                        ApplicationBankSubstatusCode applicationSubstatusCode,
+                                        String statusMessage) {
+        application.setBankStatusCode(applicationStatusCode);
+        application.setBankSubstatusCode(applicationSubstatusCode);
+        application.setStatusMessage(statusMessage);
+        applicationRepository.saveAndFlush(application);
+        clientCashExchangeService.sendApplicationStatusUpdate(
+                application.getId(),
+                applicationStatusCode != null ? application.getBankStatusCode().name() : null,
+                applicationSubstatusCode != null ? application.getBankSubstatusCode().name() : null,
+                application.getStatusMessage());
+    }
+}
