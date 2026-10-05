@@ -1,1 +1,669 @@
 
+package ru.vtb.business.regular.kasenc.bankcash.mapper;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Service;
+import ru.vtb.business.regular.kasenc.bankcash.domain.*;
+import ru.vtb.business.regular.kasenc.bankcash.domain.cashin.Cashin;
+import ru.vtb.business.regular.kasenc.bankcash.domain.cashout.Cashout;
+import ru.vtb.business.regular.kasenc.bankcash.dto.EmployeeShortInfoDto;
+import ru.vtb.business.regular.kasenc.bankcash.exception.BankCashBusinessException;
+import ru.vtb.business.regular.kasenc.bankcash.exception.BankCashDepositorException;
+import ru.vtb.business.regular.kasenc.common.domain.Channel;
+import ru.vtb.business.regular.kasenc.exceptions.KasencBusinessException;
+import ru.vtb.business.regular.kasenc.externalservices.frkk.service.FRKKSessionSecurityService;
+import ru.vtb.business.regular.kasenc.externalservices.savobsk.dto.UserStatus;
+import ru.vtb.business.regular.kasenc.externalservices.savobsk.dto.WSUserType;
+import ru.vtb.business.regular.kasenc.externalservices.savobsk.dto.activityengineservice.Resolution;
+import ru.vtb.business.regular.kasenc.externalservices.savobsk.dto.activityengineservice.UpdateType;
+import ru.vtb.business.regular.kasenc.externalservices.savobsk.dto.adaptiveauthentication.*;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.SpmRequestHeader;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.AccountData;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.Amount;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.DeviceData;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.DeviceRequest;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.EventData;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.IdentificationData;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.TransactionData;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.checkoperation.request.*;
+import ru.vtb.business.regular.kasenc.externalservices.spm.dto.updateactivity.request.SpmUpdActRequestBody;
+import ru.vtb.business.regular.kasenc.reftables.dto.BankBranchesDto;
+import ru.vtb.business.regular.kasenc.reftables.dto.BankSalePointDto;
+import ru.vtb.business.regular.kasenc.reftables.dto.CountryDto;
+import ru.vtb.business.regular.kasenc.reftables.dto.DocumentTypeDto;
+import ru.vtb.business.regular.kasenc.reftables.service.RefTablesClient;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * Маппинг документов СУБО в запросы СПМ (ANALYZE и update/activity).
+ *
+ * Публичные методы и состав/порядок фактов — как были. Все изменения помечены комментариями
+ * "ИЗМЕНЕНО" (рефакторинг без смены значений), "ИСПРАВЛЕНО" (меняется значение поля) и "УДАЛЕНО".
+ *
+ * ИЗМЕНЕНО: три метода по 100–150 строк разобраны на общие блоки запроса (заголовок, identificationData,
+ * deviceManagementRequest, сумма, счета) и отдельные методы со списками фактов по каждому документу.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class SpmMapper {
+
+    // ===================================== константы =====================================
+
+    private static final String SUBO = "SUBO";
+    private static final String TBCC_INTS = "TBCC_IntS";
+    // ИЗМЕНЕНО: SUBO_SOURCE_SYSTEM и SUBO_SOURCE_SYSTEM_SPM были двумя константами с одним значением — оставлена одна
+    private static final String SUBO_SOURCE_SYSTEM = "1453 СУБО КАССА СМБ";
+    private static final String PKBUL = "PKBUL";
+    private static final String RUB = "RUB";
+    private static final String CORPORATE = "CORPORATE";               // ИЗМЕНЕНО: литерал вынесен в константу
+    private static final String UPDATE_DEVICE = "UPDATE_DEVICE";       // ИЗМЕНЕНО: литерал вынесен в константу
+    private static final String HARD_BIND = "HARD_BIND";               // ИЗМЕНЕНО: литерал вынесен в константу
+    private static final String TRANSFER_MEDIUM_INTERNAL = "INTERNAL"; // ИЗМЕНЕНО: литерал вынесен в константу
+    private static final String X_INITIATOR_SERVICE = "bank-cash";
+    private static final String REQUEST_TYPE = "ANALYZE";
+
+    private static final int NAME_MAX_LENGTH = 160; // ИЗМЕНЕНО: "магические" 160 и 255 вынесены в константы
+    private static final int TEXT_MAX_LENGTH = 255;
+
+    private static final String SALE_POINT_NOT_FOUND = "Отделение %s не найдено";
+    private static final String DOCUMENT_TYPE_NOT_FOUND = "Тип документа %s не найден";
+    private static final String COUNTRY_NOT_FOUND = "Код страны %s не найден";
+
+    private static final String CASH_OVN_DEP = "CASH_OVN_DEP";
+    private static final String CASH_PKO_NOTARY_DEP = "CASH_PKO_NOTARY_DEP";
+    private static final String CASH_OVN_DESCRIPTION = "Объявление на взнос наличными (ОВН)";
+    private static final String CASH_PCO_NOTARY_DESCRIPTION = "Приходный кассовый ордер для нотариуса";
+
+    /**
+     * ИЗМЕНЕНО: было "String paymentPurpose = "Назначение платежа"" + if (hasText(...)) + substring(0, 255) —
+     * условие всегда истинно, обрезка ничего не обрезает. Значение то же.
+     * TODO уточнить у аналитика: в факт "Назначение платежа" заявки уходит сам текст "Назначение платежа",
+     *  а не назначение из заявки. По замечаниям ПСИ для REQUEST_CASH поля приняты, поэтому не меняю.
+     */
+    private static final String APPLICATION_PAYMENT_PURPOSE = "Назначение платежа";
+
+    // УДАЛЕНО: CLIENT_TYPE_MAPPING (изменяемый static HashMap, нигде не заполнялся и не читался)
+
+    // TODO 'hh' — 12-часовой формат: время вида "T13:00" не распарсится. Оставлено как было, проверьте формат данных.
+    private static final DateTimeFormatter BIRTH_DATE_TO_DATE_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd['T'hh:mm[:ss]]").withLocale(new Locale("ru", "RU"));
+    private static final DateTimeFormatter DATE_TO_SPM_STRING_FORMATTER =
+            DateTimeFormatter.ofPattern("dd.MM.yyyy").withLocale(new Locale("ru", "RU"));
+
+    // ИЗМЕНЕНО: все справочные маппинги — static final с именами в UPPER_CASE
+    private static final Map<ProductTypeCode, String> CASHOUT_EVENT_TYPES = Map.of(
+            ProductTypeCode.CASHWITHOUTCHECK, "CASH_WITH_REQUEST",
+            ProductTypeCode.CASHWITHCHECK, "CASH_WITHOUT_REQUEST",
+            ProductTypeCode.CASHDELIVERY, "CASH_WITHOUT_REQUEST"
+    );
+    private static final Map<ProductTypeCode, String> CASHOUT_EVENT_DESCRIPTIONS = Map.of(
+            ProductTypeCode.CASHWITHOUTCHECK, "Выдача наличных по РКО с заявкой из ДБО",
+            ProductTypeCode.CASHWITHCHECK, "Выдача наличных по чеку без заявки из ДБО",
+            ProductTypeCode.CASHDELIVERY, "Выдача наличных в офисе Банка для доставки по чеку"
+    );
+    private static final Map<ProductTypeCode, String> APPLICATION_EVENT_TYPES = Map.of(
+            ProductTypeCode.CASHWITHOUTCHECK, "REQUEST_CASH",
+            ProductTypeCode.CASHWITHCHECK, "RESERVE_CASH"
+    );
+    private static final Map<ProductTypeCode, String> APPLICATION_EVENT_DESCRIPTIONS = Map.of(
+            ProductTypeCode.CASHWITHOUTCHECK, "Заявка на получение наличных",
+            ProductTypeCode.CASHWITHCHECK, "Заявка на бронирование наличных"
+    );
+    private static final Map<Channel, ChannelIndicatorType> CHANNEL_INDICATORS = Map.of(
+            Channel.IB, ChannelIndicatorType.WEB,
+            Channel.SMMB, ChannelIndicatorType.MOBILE
+    );
+    private static final Map<Channel, String> CLIENT_DEFINED_CHANNEL_INDICATORS = Map.of(
+            Channel.IB, "SUBO_WEB",
+            Channel.SMMB, "SUBO_MOB"
+    );
+
+    private final FRKKSessionSecurityService frkkSessionSecurityService;
+    private final RefTablesClient refTablesClient;
+
+    // ================================ заявка на получение ================================
+
+    public SpmAnalyzeRequest mapApplicationToSpmAnalyzeRequest(Application application) {
+        String mdmCode = application.getClientSnapshot().getMdmCode();
+        ProductTypeCode productTypeCode = application.getProductTypeCode();
+
+        SpmAnalyzeRequestBody body = SpmAnalyzeRequestBody.builder()
+                .channelIndicator(Optional.ofNullable(CHANNEL_INDICATORS.get(application.getChannel()))
+                        .orElse(ChannelIndicatorType.OTHER))
+                .clientDefinedChannelIndicator(
+                        Objects.requireNonNull(CLIENT_DEFINED_CHANNEL_INDICATORS.get(application.getChannel())))
+                .identificationData(identificationData(mdmCode, application.getId(), application.getCreatedUserLogin()))
+                .autoCreateUserFlag(true)
+                .runRiskType(RunRiskType.ALL)
+                .deviceManagementRequest(deviceManagementRequest())
+                .deviceRequest(applicationDeviceRequest(application))
+                .eventData(EventData.builder()
+                        .eventType(EventType.CLIENT_DEFINED)
+                        .clientDefinedEventType(Objects.requireNonNull(APPLICATION_EVENT_TYPES.get(productTypeCode)))
+                        .eventDescription(Objects.requireNonNull(APPLICATION_EVENT_DESCRIPTIONS.get(productTypeCode)))
+                        .transactionData(TransactionData.builder()
+                                .amount(amountInKopecks(application.getOperationSum()))
+                                .myAccountData(accountData(application.getCashoutAccount(),
+                                        application.getClientSnapshot().getShortName(),
+                                        application.getAccountBranchBik()))
+                                .build())
+                        .clientDefinedAttributeList(applicationFacts(application).toAttributes())
+                        .build())
+                .build();
+
+        return SpmAnalyzeRequest.builder()
+                // заголовок заявки отличается от РКО/ПКО: xReplyAsyncKafka, без xInitiatorService/xInitiatorHost — как было
+                .requestHeader(SpmRequestHeader.builder()
+                        .xMdmId(mdmCode)
+                        .requestType(REQUEST_TYPE)
+                        .xReplyAsyncKafka(true)
+                        .build())
+                .requestBody(body)
+                .build();
+    }
+
+    private Facts applicationFacts(Application application) {
+        ApplicationFundsRecipient recipient = application.getFundsRecipient();
+        DocumentTypeDto documentType = getDocumentType(recipient.getDocumentTypeCode());
+        BankSalePointDto salePoint = getSalePoint(application.getSalePoint().getSalePointCode());
+        String recipientFullName = fullName(recipient.getLastName(), recipient.getFirstName(), recipient.getMiddleName());
+
+        Facts facts = new Facts()
+                .add("ID сессии", application.getCreatedUserSessionId())
+                .add("ИНН плательщика", application.getClientSnapshot().getInn())
+                .add("БИК плательщика", application.getAccountBranchBik())
+                .add("Код подразделения", application.getBankSalePointBisCode())
+                .add("Планируемая дата операции", DATE_TO_SPM_STRING_FORMATTER.format(application.getOperationDate()))
+                .add("SystemId", TBCC_INTS)
+                .add("Номер документа", application.getNumber())
+                // УДАЛЕНО: закомментированный факт "Тип подписания"
+                .add("Система источник", SUBO_SOURCE_SYSTEM)
+                .add("Бал.счет плательщика", balanceAccount(application.getCashoutAccount()))
+                .add("Бал.счет плательщика 1-го порядка", firstOrderBalanceAccount(application.getCashoutAccount()))
+                .add("БИК (SWIFT) плательщика", application.getAccountBranchBik())
+                .add("БИК клиента", application.getAccountBranchBik())
+                .add("Идентификатор заявки", application.getId().toString())
+                .add("Название ТП", salePoint.getTpShortName())
+                .add("Наименование банка отправителя", application.getAccountBranchName())
+                .add("Номер счета плательщика", application.getCashoutAccount())
+                .add("Сумма операции в рублях", rubles(application.getOperationSum()))
+                .add("Тип ДУЛ доверенного лица", documentType.getDescription())
+                .add("Наименование плательщика", application.getClientSnapshot().getFullName())
+                .add("Назначение платежа", APPLICATION_PAYMENT_PURPOSE)
+                .add("ФИО доверенного лица", recipientFullName)
+                .add("Наименование получателя", recipientFullName)
+                .add("Дата рождения доверенного лица", applicationRecipientBirthDate(recipient.getBirthDateTime()))
+                .add("Страна ДУЛ доверенного лица", recipient.getIssueCode())
+                .add("Сведения о ДУЛ доверенного лица", dulInfo(recipient.getDocSeries(), recipient.getDocNumber()));
+
+        // ИЗМЕНЕНО: общий метод для кассовых символов заявки, РКО и ПКО
+        return addCashSymbols(facts, application.getCashSymbols(), s -> s.getCashSymbolCode(), s -> s.getSum());
+    }
+
+    private static DeviceRequest applicationDeviceRequest(Application application) {
+        var deviceInfo = application.getApplicationDeviceInfo();
+        return DeviceRequest.builder()
+                .mobileSdkData(deviceInfo.getMobileSdkData())
+                .devicePrint(deviceInfo.getDevicePrint())
+                .httpAccept(deviceInfo.getHttpAccept())
+                .httpAcceptCharset(deviceInfo.getHttpAcceptCharset())
+                .httpAcceptEncoding(deviceInfo.getHttpAcceptEncoding())
+                .httpAcceptLanguage(deviceInfo.getHttpAcceptLanguage())
+                .httpReferer(deviceInfo.getHttpReferer())
+                .userAgent(deviceInfo.getUserAgent())
+                .ipAddress(deviceInfo.getIpAddress())
+                .build();
+    }
+
+    /** Нет даты — warn и пустое значение, неверный формат — исключение (как было). */
+    private static String applicationRecipientBirthDate(String birthDate) {
+        try {
+            Optional<String> spmDate = toSpmDate(birthDate);
+            if (spmDate.isEmpty()) {
+                log.warn("Отсутствует дата рождения плательщика");
+            }
+            return spmDate.orElse(null);
+        } catch (DateTimeParseException e) {
+            throw new BankCashBusinessException("Дата рождения плательщика в неверном формате " + birthDate);
+        }
+    }
+
+    // ============================== РКО (выдача наличных) ===============================
+
+    public SpmAnalyzeRequest mapCashoutToSpmAnalyzeRequest(Cashout cashout) {
+        String employeeLogin = Optional.ofNullable(frkkSessionSecurityService.getEmployeeLogin()).orElse("");
+        return mapCashoutToSpmAnalyzeRequest(cashout, employeeLogin);
+    }
+
+    /**
+     * ИЗМЕНЕНО: метод оставлен ради совместимости. Если вызовов нет — удалите
+     * (имя отличается от соседнего только регистром "SPM").
+     */
+    public SpmAnalyzeRequest mapCashoutToSPMAnalyzeRequest(Cashout cashout, EmployeeShortInfoDto employeeShortInfoDto) {
+        return mapCashoutToSpmAnalyzeRequest(cashout, employeeShortInfoDto.getLogin());
+    }
+
+    // ИЗМЕНЕНО: было mapCashoutToSpmAnalyzeInternally
+    private SpmAnalyzeRequest mapCashoutToSpmAnalyzeRequest(Cashout cashout, String employeeLogin) {
+        String mdmCode = cashout.getCashoutClientSnapshot().getMdmCode();
+        ProductTypeCode eventProductType = cashoutEventProductType(cashout.getProductTypeCode());
+        String recipientFullName = cashoutRecipientFullName(cashout);
+        String branchBik = Optional.ofNullable(cashout.getAccountBranchInfo()).map(AccountBranchInfo::getBik).orElse(null);
+
+        SpmAnalyzeRequestBody body = SpmAnalyzeRequestBody.builder()
+                .channelIndicator(ChannelIndicatorType.BRANCH)
+                .clientDefinedChannelIndicator(SUBO)
+                .identificationData(identificationData(mdmCode, cashout.getId(), employeeLogin))
+                .autoCreateUserFlag(true)
+                .runRiskType(RunRiskType.ALL)
+                .deviceManagementRequest(deviceManagementRequest())
+                .eventData(EventData.builder()
+                        .eventType(EventType.WITHDRAW)
+                        .clientDefinedEventType(CASHOUT_EVENT_TYPES.get(eventProductType))
+                        .eventDescription(CASHOUT_EVENT_DESCRIPTIONS.get(eventProductType))
+                        .transactionData(branchTransaction(cashout.getOperationSum())
+                                .otherAccountData(accountData(null, recipientFullName, branchBik))
+                                .myAccountData(accountData(cashout.getCashoutAccount(),
+                                        sanitize(cashout.getCashoutClientSnapshot().getShortName(), NAME_MAX_LENGTH),
+                                        branchBik))
+                                .build())
+                        .clientDefinedAttributeList(cashoutFacts(cashout).toAttributes())
+                        .build())
+                .build();
+
+        return SpmAnalyzeRequest.builder()
+                .requestHeader(documentHeader(mdmCode))
+                .requestBody(body)
+                .build();
+    }
+
+    private Facts cashoutFacts(Cashout cashout) {
+        ProductTypeCode productTypeCode = cashout.getProductTypeCode();
+        var recipient = cashout.getCashoutFundsRecipient();
+        BankBranchesDto accountBankBranch = refTablesClient.getBankBranchByCftCode(cashout.getCashoutAccountAbsBranchCode());
+        BankSalePointDto salePoint = getSalePoint(cashout.getBankSalePointBisCode());
+        DocumentTypeDto documentType = getDocumentType(recipient.getDocumentTypeCode());
+        String recipientFullName = cashoutRecipientFullName(cashout);
+
+        Facts facts = new Facts()
+                .add("ИНН плательщика", cashout.getCashoutClientSnapshot().getInn())
+                .add("Код подразделения", salePoint.getBranchCode())
+                .add("Название ТП", sanitize(cashout.getCashoutSalePoint().getTpShortName(), TEXT_MAX_LENGTH))
+                .add("Наименование получателя", recipientFullName)
+                .add("Сведения о ДУЛ доверенного лица", dulInfo(recipient.getDocSeries(), recipient.getDocNumber()))
+                .add("ФИО доверенного лица", recipientFullName)
+                .add("ФИО сотрудника", sanitize(fullName(cashout.getSentToControlLastName(),
+                        cashout.getSentToControlFirstName(), cashout.getSentToControlMiddleName()), NAME_MAX_LENGTH))
+                .add("SystemId", TBCC_INTS)
+                .add("Номер документа", productTypeCode == ProductTypeCode.CASHWITHOUTCHECK
+                        ? String.valueOf(cashout.getRkoNumber())
+                        : String.join(" ", cashout.getCheckSeries(), cashout.getCheckNumber()))
+                .add("Наименование банка отправителя", sanitize(accountBankBranch.getName(), TEXT_MAX_LENGTH))
+                .add("Назначение платежа", sanitize(cashout.getCashoutPurpose(), TEXT_MAX_LENGTH))
+                .add("Наименование плательщика", sanitize(cashout.getCashoutClientSnapshot().getShortName(), NAME_MAX_LENGTH))
+                .add("Система источник", SUBO_SOURCE_SYSTEM)
+                .add("Бал.счет плательщика", balanceAccount(cashout.getCashoutAccount()))
+                .add("Бал.счет плательщика 1-го порядка", firstOrderBalanceAccount(cashout.getCashoutAccount()))
+                .add("БИК плательщика", accountBankBranch.getBik())
+                .add("БИК (SWIFT) плательщика", accountBankBranch.getBik())
+                .add("БИК клиента", accountBankBranch.getBik())
+                .add("Номер счета плательщика", cashout.getCashoutAccount())
+                .add("Сумма операции в рублях", rubles(cashout.getOperationSum()))
+                .add("Тип ДУЛ доверенного лица", documentType.getDescription())
+                .add("Логин сотрудника, создавшего операцию", cashout.getSentToControlEmployeeLogin())
+                .add("Страна ДУЛ доверенного лица", cashoutRecipientIssueCountry(cashout))
+                .add("Планируемая дата операции", cashout.getOperationDate().format(DATE_TO_SPM_STRING_FORMATTER));
+
+        if (productTypeCode == ProductTypeCode.CASHWITHOUTCHECK) {
+            // TODO уточнить: для РКО по заявке в "Идентификатор заявки" уходит id РКО, а не id заявки. Оставлено как было.
+            facts.add("Идентификатор заявки", String.valueOf(cashout.getId()));
+        }
+        return addCashSymbols(facts, cashout.getSymbols(), s -> s.getCashSymbolCode(), s -> s.getSymbolSum());
+    }
+
+    /** Реестровая выдача без чека описывается в СПМ как CASHWITHOUTCHECK. */
+    private static ProductTypeCode cashoutEventProductType(ProductTypeCode productTypeCode) {
+        return productTypeCode == ProductTypeCode.REGISTRYAPPCASHWITHOUTCHECK
+                ? ProductTypeCode.CASHWITHOUTCHECK
+                : productTypeCode;
+    }
+
+    private static String cashoutRecipientFullName(Cashout cashout) {
+        var recipient = cashout.getCashoutFundsRecipient();
+        return sanitize(fullName(recipient.getLastName(), recipient.getFirstName(), recipient.getMiddleName()),
+                NAME_MAX_LENGTH);
+    }
+
+    /**
+     * ИСПРАВЛЕНО (замечание ПСИ, CASH_WITH_REQUEST BRANCH DENY AML: "Страна ДУЛ доверенного лица — отсутствует value").
+     * У РКО по заявке cashout_funds_recipient.issue_country_code не заполнен — берём страну ДУЛ
+     * из получателя связанной заявки (то же поле, что уходит в СПМ по самой заявке).
+     * TODO по-хорошему копировать страну при создании РКО из заявки (cashoutMapper.toCashoutWithApplication),
+     *  тогда этот fallback не нужен. Связь application должна быть загружена (@EntityGraph), иначе LazyInitializationException.
+     */
+    private static String cashoutRecipientIssueCountry(Cashout cashout) {
+        String issueCountry = cashout.getCashoutFundsRecipient().getIssueCountryCode();
+        if (StringUtils.isBlank(issueCountry) && cashout.getApplication() != null) {
+            return cashout.getApplication().getFundsRecipient().getIssueCode();
+        }
+        return issueCountry;
+    }
+
+    // ===================== ПКО: ОВН и приходный кассовый ордер нотариуса =====================
+
+    public SpmAnalyzeRequest mapCashinOvnPkoNotaryDepToSpmAnalyzeRequest(Cashin cashin) {
+        var recipient = cashin.getCashinFundsRecipient();
+
+        // проверки до формирования запроса — в том же порядке, что были
+        DocumentTypeDto documentType = getDocumentType(recipient.getDocumentTypeCode());
+        // ИЗМЕНЕНО: результат getCountry не использовался (CountryDto countryDto) — оставлена только проверка,
+        // что страна есть в справочнике; в факт по-прежнему уходит код страны
+        requireCountryExists(recipient.getIssueCountryCode());
+        String recipientBirthDate = cashinRecipientBirthDate(recipient.getBirthDate());
+        if (cashin.getAccountBranchInfo() == null || StringUtils.isEmpty(cashin.getAccountBranchInfo().getBik())) {
+            throw new BankCashBusinessException("Отсутствуют данные по филиалу получателя");
+        }
+        if (cashin.getSalePointBranchInfo() == null || StringUtils.isEmpty(cashin.getSalePointBranchInfo().getBik())) {
+            throw new BankCashBusinessException("Отсутствуют данные по филиалу банка отправителя");
+        }
+
+        boolean isOvn = ProductTypeCode.OVN.equals(cashin.getProductTypeCode());
+        String mdmCode = cashin.getCashinClientSnapshot().getMdmCode();
+
+        SpmAnalyzeRequestBody body = SpmAnalyzeRequestBody.builder()
+                .channelIndicator(ChannelIndicatorType.BRANCH)
+                .clientDefinedChannelIndicator(SUBO)
+                .identificationData(identificationData(mdmCode, cashin.getId(), frkkSessionSecurityService.getEmployeeLogin()))
+                .autoCreateUserFlag(false) // TODO у заявки и РКО true — уточнить, намеренно ли
+                .runRiskType(RunRiskType.ALL)
+                .deviceManagementRequest(deviceManagementRequest())
+                .eventData(EventData.builder()
+                        .eventType(EventType.DEPOSIT)
+                        .clientDefinedEventType(isOvn ? CASH_OVN_DEP : CASH_PKO_NOTARY_DEP)
+                        .eventDescription(isOvn ? CASH_OVN_DESCRIPTION : CASH_PCO_NOTARY_DESCRIPTION)
+                        .transactionData(branchTransaction(cashin.getOperationSum())
+                                .otherAccountData(accountData(cashin.getCashinAccount(),
+                                        sanitize(cashin.getCashinClientSnapshot().getFullName(), NAME_MAX_LENGTH),
+                                        cashin.getAccountBranchInfo().getBik()))
+                                .myAccountData(accountData(null,
+                                        cashinRecipientFullName(cashin),
+                                        cashin.getSalePointBranchInfo().getBik()))
+                                .build())
+                        .clientDefinedAttributeList(cashinFacts(cashin, documentType, recipientBirthDate).toAttributes())
+                        .build())
+                .build();
+
+        return SpmAnalyzeRequest.builder()
+                .requestHeader(documentHeader(mdmCode))
+                .requestBody(body)
+                .build();
+    }
+
+    private static Facts cashinFacts(Cashin cashin, DocumentTypeDto documentType, String recipientBirthDate) {
+        var recipient = cashin.getCashinFundsRecipient();
+        String recipientFullName = cashinRecipientFullName(cashin);
+        String receiverBik = cashin.getAccountBranchInfo().getBik();
+
+        Facts facts = new Facts()
+                .add("SystemId", TBCC_INTS)
+                .add("Номер документа", String.valueOf(cashin.getDocNumber()))
+                .add("Назначение платежа", sanitize(cashin.getCashinPurpose(), TEXT_MAX_LENGTH))
+                .add("Наименование плательщика", recipientFullName)
+                .add("ИНН плательщика", cashin.getCashinClientSnapshot().getInn())
+                .add("Сведения о ДУЛ доверенного лица", dulInfo(recipient.getDocSeries(), recipient.getDocNumber()))
+                .add("ФИО доверенного лица", recipientFullName)
+                .add("Дата рождения доверенного лица", recipientBirthDate)
+                .add("Тип ДУЛ доверенного лица", documentType.getDescription())
+                .add("Страна ДУЛ доверенного лица", recipient.getIssueCountryCode())
+                .add("БИК получателя", receiverBik)
+                .add("Наименование банка получателя", sanitize(cashin.getAccountBranchInfo().getName(), TEXT_MAX_LENGTH))
+                .add("Наименование получателя", sanitize(cashin.getCashinClientSnapshot().getFullName(), NAME_MAX_LENGTH))
+                .add("ИНН получателя", cashin.getCashinClientSnapshot().getInn())
+                .add("Номер счета получателя", cashin.getCashinAccount())
+                .add("Бал.счет получателя", balanceAccount(cashin.getCashinAccount()))
+                .add("Бал.счет получателя 1-го порядка", firstOrderBalanceAccount(cashin.getCashinAccount()))
+                .add("Код подразделения", cashin.getBankSalePointBisCode())
+                .add("Название ТП", sanitize(cashin.getBankSalePointName(), TEXT_MAX_LENGTH))
+                .add("Сумма операции в рублях", rubles(cashin.getOperationSum()))
+                .add("Система источник", SUBO_SOURCE_SYSTEM)
+                .add("БИК клиента", receiverBik)
+                .add("БИК (SWIFT) получателя", receiverBik)
+                .add("Логин сотрудника, создавшего операцию", cashin.getSentToControlEmployeeLogin());
+
+        return addCashSymbols(facts, cashin.getSymbols(), s -> s.getCashSymbolCode(), s -> s.getSum());
+    }
+
+    private static String cashinRecipientFullName(Cashin cashin) {
+        var recipient = cashin.getCashinFundsRecipient();
+        return sanitize(fullName(recipient.getLastName(), recipient.getFirstName(), recipient.getMiddleName()),
+                NAME_MAX_LENGTH);
+    }
+
+    /** Дата обязательна: нет даты или неверный формат — исключение (как было). */
+    private static String cashinRecipientBirthDate(String birthDate) {
+        try {
+            return toSpmDate(birthDate)
+                    .orElseThrow(() -> new BankCashDepositorException("Отсутствует дата рождения плательщика"));
+        } catch (DateTimeParseException e) {
+            throw new BankCashDepositorException("Дата рождения плательщика в неверном формате " + birthDate);
+        }
+    }
+
+    // ================================== update/activity ==================================
+
+    public SpmUpdActRequestBody mapToUpdateActivity(UpdateType updateType, String description, String actionSubCode) {
+        return SpmUpdActRequestBody.builder()
+                .messageHeader(ru.vtb.business.regular.kasenc.externalservices.spm.dto.updateactivity.request.MessageHeader.builder()
+                        .updateType(updateType)
+                        .build())
+                .updateStatus(ru.vtb.business.regular.kasenc.externalservices.spm.dto.updateactivity.request.UpdateStatus.builder()
+                        .resolution(Resolution.UNKNOWN)
+                        .description(description)
+                        .actionSubCode(actionSubCode)
+                        .build())
+                .build();
+    }
+
+    // ============================ общие блоки запроса ANALYZE =============================
+    // ИЗМЕНЕНО: блоки, которые повторялись в трёх методах, вынесены сюда; значения не менялись
+
+    /** Заголовок для РКО и ПКО. */
+    private static SpmRequestHeader documentHeader(String mdmCode) {
+        return SpmRequestHeader.builder()
+                .xInitiatorService(X_INITIATOR_SERVICE)
+                .xInitiatorHost(System.getenv("HOSTNAME"))
+                .xMdmId(mdmCode)
+                .requestType(REQUEST_TYPE)
+                .build();
+    }
+
+    private static IdentificationData identificationData(String mdmCode, Object documentId, String userLogin) {
+        return IdentificationData.builder()
+                .userName(PKBUL + mdmCode)
+                .clientTransactionId(documentId.toString())
+                .userLoginName(userLogin)
+                .orgName(CORPORATE)
+                .userType(WSUserType.PERSISTENT)
+                .userStatus(UserStatus.VERIFIED)
+                .build();
+    }
+
+    private static DeviceManagementRequest deviceManagementRequest() {
+        return DeviceManagementRequest.builder()
+                .actionTypeList(ActionTypes.builder()
+                        .deviceActionTypes(UPDATE_DEVICE)
+                        .deviceData(DeviceData.builder()
+                                .bindingType(HARD_BIND)
+                                .build())
+                        .build())
+                .build();
+    }
+
+    /** Операция в отделении (РКО, ПКО): сумма + немедленное внутреннее исполнение. Счета добавляет вызывающий. */
+    private static TransactionData.TransactionDataBuilder branchTransaction(BigDecimal operationSum) {
+        return TransactionData.builder()
+                .amount(amountInKopecks(operationSum))
+                .executionSpeed(ExecutionSpeed.REAL_TIME)
+                .schedule(Schedule.IMMEDIATE)
+                .transferMediumType(TRANSFER_MEDIUM_INTERNAL);
+    }
+
+    private static Amount amountInKopecks(BigDecimal operationSum) {
+        return Amount.builder()
+                .amount(operationSum.movePointRight(2).longValue())
+                .currency(RUB) // ИЗМЕНЕНО: у заявки был литерал "RUB" — значение то же
+                .build();
+    }
+
+    private static AccountData accountData(String accountNumber, String accountName, String routingCode) {
+        return AccountData.builder()
+                .accountNumber(accountNumber)
+                .accountName(accountName)
+                .internationalAccountNumber(null)
+                .routingCode(routingCode)
+                .build();
+    }
+
+    // =============================== значения фактов ===============================
+
+    /**
+     * Список фактов clientDefinedAttributeList в порядке добавления.
+     * ИЗМЕНЕНО: вместо List.of(...) + new ArrayList<>(...) + ручного stream в ClientDefinedAttribute в каждом методе.
+     */
+    private static final class Facts {
+
+        private final List<Fact> facts = new ArrayList<>();
+
+        Facts add(String name, String value) {
+            facts.add(Fact.builder()
+                    .name(name)
+                    .value(value)
+                    .dataType(DataType.STRING)
+                    .build());
+            return this;
+        }
+
+        List<ClientDefinedAttribute> toAttributes() {
+            return facts.stream()
+                    .map(fact -> ClientDefinedAttribute.builder().fact(fact).build())
+                    .collect(Collectors.toList());
+        }
+    }
+
+    /**
+     * Один символ — "Кассовый символ" = код; несколько — "Кассовый символ и сумма" = "код_сумма;код_сумма".
+     * ИЗМЕНЕНО: было три реализации (у заявки инлайн, у РКО и ПКО — toCashSymbolsString(Cashout/Cashin)).
+     * ИЗМЕНЕНО: у заявки для одного символа без кода подставлялось "CASH_SYMBOL" — заглушка убрана,
+     *  теперь как у РКО и ПКО (код символа как есть).
+     */
+    private static <T> Facts addCashSymbols(Facts facts, Collection<T> symbols,
+                                            Function<T, String> code, Function<T, BigDecimal> sum) {
+        if (symbols == null || symbols.isEmpty()) {
+            return facts;
+        }
+        if (symbols.size() == 1) {
+            return facts.add("Кассовый символ", code.apply(symbols.iterator().next()));
+        }
+        String codesWithSums = symbols.stream()
+                .map(symbol -> String.join("_", code.apply(symbol), sum.apply(symbol).toPlainString()))
+                .collect(Collectors.joining(";"));
+        return facts.add("Кассовый символ и сумма", codesWithSums);
+    }
+
+    /**
+     * "Фамилия Имя Отчество" без пустых частей.
+     * ИСПРАВЛЕНО: у РКО и ПКО был String.join(" ", фамилия, имя, отчество) — при отсутствии отчества
+     *  в СПМ уходило "Иванов Иван null". У заявки при пустом имени получался двойной пробел.
+     */
+    private static String fullName(String lastName, String firstName, String middleName) {
+        return Stream.of(lastName, firstName, middleName)
+                .filter(StringUtils::isNotBlank)
+                .collect(Collectors.joining(" "));
+    }
+
+    /**
+     * Серия (без пробелов) + номер ДУЛ.
+     * ИСПРАВЛЕНО: при отсутствии номера уходило "...null", теперь пустая строка.
+     */
+    private static String dulInfo(String docSeries, Object docNumber) {
+        return StringUtils.defaultString(docSeries).replaceAll("\\s", "") + Objects.toString(docNumber, "");
+    }
+
+    private static String rubles(BigDecimal operationSum) {
+        return operationSum.setScale(2, RoundingMode.HALF_UP).toPlainString();
+    }
+
+    /** Балансовый счёт второго порядка — первые 5 цифр счёта. */
+    private static String balanceAccount(String account) {
+        return account.substring(0, 5);
+    }
+
+    /** Балансовый счёт первого порядка — первые 3 цифры счёта. */
+    private static String firstOrderBalanceAccount(String account) {
+        return account.substring(0, 3);
+    }
+
+    /** yyyy-MM-dd[Thh:mm[:ss]] -> dd.MM.yyyy; пусто, если даты нет. */
+    private static Optional<String> toSpmDate(String birthDate) {
+        if (StringUtils.isEmpty(birthDate)) {
+            return Optional.empty();
+        }
+        return Optional.of(LocalDate.parse(birthDate, BIRTH_DATE_TO_DATE_FORMATTER).format(DATE_TO_SPM_STRING_FORMATTER));
+    }
+
+    /**
+     * Убирает кавычки и обрезает до maxLength символов (по code point'ам).
+     * ИЗМЕНЕНО: было formatStringForSAVOBSK — переименовано, логика та же.
+     */
+    private static String sanitize(String value, int maxLength) {
+        return Optional.ofNullable(value).orElse("").replaceAll("[`'\"]", "")
+                .codePoints()
+                .limit(maxLength)
+                .collect(() -> new StringBuilder(maxLength), StringBuilder::appendCodePoint, StringBuilder::append)
+                .toString();
+    }
+
+    // =================================== справочники ===================================
+
+    private BankSalePointDto getSalePoint(String salePointCode) {
+        return refTablesClient.getBankSalePointsTpBisCode(salePointCode)
+                .getBankSalePoints().stream()
+                .findFirst()
+                .orElseThrow(() -> new KasencBusinessException(String.format(SALE_POINT_NOT_FOUND, salePointCode)));
+    }
+
+    private DocumentTypeDto getDocumentType(String documentTypeCode) {
+        return refTablesClient.getDocumentType().getDocumentTypes().stream()
+                .filter(documentType -> documentType.getDocumentTypeId().equals(documentTypeCode))
+                .findFirst()
+                .orElseThrow(() -> new BankCashBusinessException(String.format(DOCUMENT_TYPE_NOT_FOUND, documentTypeCode)));
+    }
+
+    // ИЗМЕНЕНО: было getCountry(...) с неиспользуемым результатом
+    private void requireCountryExists(String issueCountryCode) {
+        boolean exists = refTablesClient.getCountry().getCountries().stream()
+                .map(CountryDto::getCode)
+                .anyMatch(code -> code.equals(issueCountryCode));
+        if (!exists) {
+            throw new BankCashDepositorException(String.format(COUNTRY_NOT_FOUND, issueCountryCode));
+        }
+    }
+}
